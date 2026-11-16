@@ -135,6 +135,17 @@ DEFAULT_SETTINGS = {
     "telegram_enabled": "0",
     "telegram_token": "",
     "telegram_warehouse_chat": "",
+    "onec_enabled": "0",
+    "onec_send": "1",
+    "onec_file": "",
+    "onec_server": "",
+    "onec_ref": "",
+    "onec_url": "",
+    "onec_user": "",
+    "onec_password": "",
+    "onec_days": "7",
+    "onec_last_pull": "",
+    "onec_last_error": "",
 }
 
 
@@ -359,7 +370,97 @@ def _add_task(conn, order, kind, title):
     _journal(conn, f"Заказ {order['number']}: задача «{title}»")
 
 
+def _onec_connection_ready(settings):
+    import onec
+    return onec.connection_ready(settings)
+
+
+def _pull_onec(force):
+    import onec
+    conn = connect()
+    try:
+        settings = _settings_map(conn)
+    finally:
+        conn.close()
+    if settings.get("onec_enabled") != "1":
+        return {"pulled": 0}
+    if not force and not onec.pull_due(settings):
+        return {"pulled": 0, "skipped": True}
+    try:
+        rows = onec.fetch_orders(settings)
+    except DeskError as exc:
+        _remember_onec_error(exc.message)
+        return {"pulled": 0, "error": exc.message}
+    with LOCK:
+        conn = connect()
+        try:
+            stats = _apply_onec_rows(conn, _settings_map(conn), rows)
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('onec_last_pull', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (iso(now()),),
+            )
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('onec_last_error', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (),
+            )
+            conn.commit()
+            return stats
+        finally:
+            conn.close()
+
+
+def _remember_onec_error(message):
+    with LOCK:
+        conn = connect()
+        try:
+            previous = conn.execute("SELECT value FROM settings WHERE key = 'onec_last_error'").fetchone()
+            if not previous or previous["value"] != message:
+                _journal(conn, f"1С: {message}")
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('onec_last_error', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (message[:500],),
+            )
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('onec_last_pull', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (iso(now()),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _apply_onec_rows(conn, settings, rows):
+    counts = {"new": 0, "archive": 0, "status": 0, "same": 0}
+    for row in rows:
+        kind = _upsert_csv_row(conn, settings, row, "1С", silent=bool(row.get("silent")))
+        counts[kind if kind in counts else "same"] += 1
+    if counts["new"] or counts["archive"] or counts["status"]:
+        _journal(
+            conn,
+            f"1С: новых {counts['new']}, прошлых дней {counts['archive']}, со сменой статуса {counts['status']}",
+        )
+    return counts
+
+
+def pull_onec(force=True):
+    return _pull_onec(force=force)
+
+
+def test_onec():
+    import onec
+    conn = connect()
+    try:
+        settings = _settings_map(conn)
+    finally:
+        conn.close()
+    if settings.get("onec_enabled") != "1":
+        raise DeskError("Сначала включите обмен с 1С и сохраните настройки")
+    return onec.ping(settings)
+
+
 def _channel_ready(settings, channel):
+    if channel == "onec":
+        return settings.get("onec_enabled") == "1" and settings.get("onec_send") == "1" and _onec_connection_ready(settings)
     if channel == "sms":
         return settings.get("sms_enabled") == "1" and bool(settings.get("smsru_api_id"))
     if channel == "email":
@@ -381,6 +482,8 @@ def _channel_ready(settings, channel):
 def _choose_channel(order, settings, template_key):
     if template_key == "warehouse":
         return "telegram", settings.get("telegram_warehouse_chat") or "склад"
+    if _channel_ready(settings, "onec") and (normalize_phone(order.get("phone")) or order.get("email")):
+        return "onec", display_phone(order.get("phone")) or order.get("email")
     if _channel_ready(settings, "sms") and normalize_phone(order.get("phone")):
         return "sms", normalize_phone(order.get("phone"))
     if _channel_ready(settings, "email") and order.get("email"):
@@ -400,7 +503,7 @@ def _queue_template(conn, order, settings, template_key):
     channel, recipient = _choose_channel(order, settings, template_key)
     status = "draft"
     error = ""
-    if settings.get("auto_send") == "1" and channel in ("sms", "email", "telegram") and _channel_ready(settings, channel):
+    if settings.get("auto_send") == "1" and channel in ("onec", "sms", "email", "telegram") and _channel_ready(settings, channel):
         try:
             _deliver(settings, channel, recipient, body, order)
             status = "sent"
@@ -694,7 +797,7 @@ def public_settings():
         data = _settings_map(conn)
     finally:
         conn.close()
-    secret_keys = ("smsru_api_id", "smtp_password", "telegram_token")
+    secret_keys = ("smsru_api_id", "smtp_password", "telegram_token", "onec_password")
     view = dict(data)
     for key in secret_keys:
         view[key + "_set"] = "1" if data.get(key) else "0"
@@ -713,7 +816,7 @@ def save_settings(payload):
             for key, value in payload.items():
                 if key not in allowed:
                     continue
-                if key in ("smsru_api_id", "smtp_password", "telegram_token") and not str(value or "").strip():
+                if key in ("smsru_api_id", "smtp_password", "telegram_token", "onec_password") and not str(value or "").strip():
                     continue
                 if key.endswith("_hours"):
                     try:
@@ -723,7 +826,15 @@ def save_settings(payload):
                     if hours < 1 or hours > 240:
                         raise DeskError("Интервал напоминания: от 1 до 240 часов")
                     value = str(hours)
-                if key in ("auto_send", "sms_enabled", "email_enabled", "telegram_enabled"):
+                if key == "onec_days":
+                    try:
+                        days = int(value)
+                    except (TypeError, ValueError):
+                        raise DeskError("Сколько дней забирать из 1С — целое число")
+                    if days < 1 or days > 60:
+                        raise DeskError("Из 1С можно забирать от 1 до 60 дней")
+                    value = str(days)
+                if key in ("auto_send", "sms_enabled", "email_enabled", "telegram_enabled", "onec_enabled", "onec_send"):
                     value = "1" if str(value) in ("1", "true", "True", "on") else "0"
                 current[key] = str(value or "")
                 conn.execute(
@@ -738,7 +849,10 @@ def save_settings(payload):
 
 
 def _deliver(settings, channel, recipient, body, order):
-    if channel == "sms":
+    if channel == "onec":
+        import onec
+        onec.send_message(settings, order, body)
+    elif channel == "sms":
         _send_sms(settings, recipient, body)
     elif channel == "email":
         _send_email(settings, recipient, body, order)
@@ -886,6 +1000,7 @@ def _age_hours(value):
 
 
 def run_tick():
+    onec_stats = _pull_onec(force=False)
     with LOCK:
         conn = connect()
         try:
@@ -919,7 +1034,7 @@ def run_tick():
                 if order["status"] == "shipped" and not (order.get("track") or "").strip():
                     _add_task(conn, order, "track", "Вписать трек, иначе клиент не получит сообщение")
             conn.commit()
-            return {"imported": imported}
+            return {"imported": imported, "onec": onec_stats}
         finally:
             conn.close()
 
@@ -1042,7 +1157,7 @@ def _amount(value, fallback=0):
         return float(fallback or 0)
 
 
-def _upsert_csv_row(conn, settings, row, source):
+def _upsert_csv_row(conn, settings, row, source, silent=False):
     number = _require_number(row.get("number"))
     existing = conn.execute("SELECT * FROM orders WHERE number = ?", (number,)).fetchone()
     status = _map_status(row.get("status"))
@@ -1092,11 +1207,15 @@ def _upsert_csv_row(conn, settings, row, source):
             )
             updated = _order_dict(conn.execute("SELECT * FROM orders WHERE id = ?", (order["id"],)).fetchone())
             _journal(conn, f"Заказ {number}: {STATUSES[order['status']]} → {STATUSES[status]} (импорт)")
-            _entry_rules(conn, updated, settings)
+            if not silent:
+                _entry_rules(conn, updated, settings)
+            return "status"
         elif track and not order["track"] and status == "shipped":
             updated = _order_dict(conn.execute("SELECT * FROM orders WHERE id = ?", (order["id"],)).fetchone())
-            _queue_template(conn, updated, settings, "shipped")
-        return
+            if not silent:
+                _queue_template(conn, updated, settings, "shipped")
+            return "track"
+        return "same"
     create_payload = {
         "number": number,
         "customer": row.get("customer"),
@@ -1141,9 +1260,11 @@ def _upsert_csv_row(conn, settings, row, source):
     )
     order = _order_dict(conn.execute("SELECT * FROM orders WHERE number = ?", (number,)).fetchone())
     _journal(conn, f"Заказ {number} загружен, статус «{STATUSES[final_status]}»")
-    _entry_rules(conn, order, settings)
+    if not silent:
+        _entry_rules(conn, order, settings)
     if asked_to_ship_without_track:
         _add_task(conn, order, "track", "Вписать трек, иначе клиент не получит сообщение")
+    return "archive" if silent else "new"
 
 
 def today_view():

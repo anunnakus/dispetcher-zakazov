@@ -144,6 +144,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 self._send(200, logic.save_settings(self._json_body()))
                 return
+            if path == "/api/onec/test":
+                self._send(200, logic.test_onec())
+                return
+            if path == "/api/onec/pull":
+                self._send(200, logic.pull_onec(force=True))
+                return
             self._send(404, {"error": "Неизвестный адрес"})
 
         self._guard(finish)

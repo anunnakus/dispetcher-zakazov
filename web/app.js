@@ -410,11 +410,29 @@ async function loadSettings() {
       <label class="check"><input type="checkbox" name="telegram_enabled" ${settings.telegram_enabled === "1" ? "checked" : ""}> Писать складу при оплате</label>
       ${setting("telegram_token", settings.telegram_token_set === "1" ? "Токен бота уже сохранён" : "Токен бота", settings, "input", "", true)}
       ${setting("telegram_warehouse_chat", "ID чата склада", settings)}
-      <h2>Импорт из 1С</h2>
+      <h2>1С</h2>
+      <p class="muted">Программа сама забирает заказы из базы, в которую вы входите утром, и создаёт сообщение в 1С. Дальше его отправляет та учётная запись SMS или почты, которая уже настроена в 1С. Логин — ваш обычный логин 1С. Пароль после сохранения не показывается.</p>
+      <label class="check"><input type="checkbox" name="onec_enabled" ${settings.onec_enabled === "1" ? "checked" : ""}> Забирать заказы из 1С</label>
+      <label class="check"><input type="checkbox" name="onec_send" ${settings.onec_send === "1" ? "checked" : ""}> Отправлять сообщения клиенту через 1С</label>
+      ${setting("onec_file", "Папка файловой базы, если внутри лежит 1Cv8.1CD", settings)}
+      <div class="grid-2">
+        ${setting("onec_server", "Сервер 1С, если база серверная", settings)}
+        ${setting("onec_ref", "Имя базы на сервере", settings)}
+      </div>
+      <div class="grid-2">
+        ${setting("onec_user", "Логин 1С", settings)}
+        ${setting("onec_password", settings.onec_password_set === "1" ? "Пароль 1С уже сохранён" : "Пароль 1С", settings, "input", "", true)}
+      </div>
+      ${setting("onec_url", "Адрес публикации, если база открывается в браузере. Иначе оставьте пустым", settings)}
+      ${setting("onec_days", "За сколько дней забирать заказы", settings)}
+      <p class="muted">Заказы прошлых дней попадут в список без сообщений клиенту. Сообщения уйдут по сегодняшним и по тем, у которых сменился статус. Повторно тот же текст не отправляется. Проверка идёт сама примерно раз в 5 минут, пока открыто чёрное окно.</p>
+      <h2>Запасной файл, если 1С недоступна</h2>
       <p class="muted">Сохраните выгрузку как CSV и положите файл в папку «входящие» рядом с программой или вставьте текст ниже. Повторный импорт того же номера обновляет заказ и не шлёт сообщение второй раз, если статус не изменился.</p>
       <textarea id="csv" placeholder="номер;клиент;телефон;состав;сумма;доставка;статус"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="btn" type="submit">Сохранить настройки</button>
+        <button class="btn-ghost" type="button" id="onec-test">Проверить 1С</button>
+        <button class="btn-ghost" type="button" id="onec-pull">Забрать заказы сейчас</button>
         <button class="btn-ghost" type="button" id="do-import">Импортировать CSV</button>
         <button class="btn-ghost" type="button" id="clear-demo">Удалить учебные заказы</button>
       </div>
@@ -427,7 +445,7 @@ async function loadSettings() {
       if (event.target.elements[key] && event.target.elements[key].type === "checkbox") continue;
       payload[key] = value;
     }
-    ["auto_send", "sms_enabled", "email_enabled", "telegram_enabled"].forEach((key) => {
+    ["auto_send", "sms_enabled", "email_enabled", "telegram_enabled", "onec_enabled", "onec_send"].forEach((key) => {
       payload[key] = event.target.elements[key].checked ? "1" : "0";
     });
     try {
@@ -445,6 +463,20 @@ async function loadSettings() {
         body: JSON.stringify({ csv: document.querySelector("#csv").value }),
       });
       toast.textContent = `Загружено строк: ${result.imported}`;
+      toast.classList.remove("hidden");
+    } catch (error) { showError(error); }
+  };
+  document.querySelector("#onec-test").onclick = async () => {
+    try {
+      const result = await api("/api/onec/test", { method: "POST" });
+      toast.textContent = result.message || "1С ответила";
+      toast.classList.remove("hidden");
+    } catch (error) { showError(error); }
+  };
+  document.querySelector("#onec-pull").onclick = async () => {
+    try {
+      const result = await api("/api/onec/pull", { method: "POST" });
+      toast.textContent = `1С: новых ${result.new || 0}, прошлых дней ${result.archive || 0}`;
       toast.classList.remove("hidden");
     } catch (error) { showError(error); }
   };
@@ -467,7 +499,7 @@ function renderHelp() {
       <h2>Каждое утро</h2>
       <ol>
         <li>На рабочем Windows дважды щёлкните «Запуск.bat», если чёрное окно ещё не открыто. Права администратора не нужны.</li>
-        <li>Выгрузите из 1С новые и изменившиеся заказы в CSV и положите файл в папку «входящие». Либо вставьте таблицу в настройках.</li>
+        <li>Если в настройках включена 1С, утренние заказы уже подтянутся сами. Иначе положите CSV в папку «входящие».</li>
         <li>На экране «Сегодня» закройте задачи и либо отправьте сообщения кнопкой, либо скопируйте текст в Манго или почту.</li>
       </ol>
       <h2>В течение дня</h2>
@@ -486,7 +518,7 @@ function renderHelp() {
         <li>Повторно тот же текст по тому же заказу не создаётся.</li>
       </ul>
       <h2>Чтобы уходило само</h2>
-      <p>В настройках включите «Отправлять самой» и один канал. SMS имеет приоритет: нужен ключ SMS.ru. Если SMS выключены, а почта включена и в заказе есть адрес, уйдёт письмо через Gmail. Складу нужен свой бот Telegram и ID общего чата. Пароль Gmail — это пароль приложения, не обычный пароль от ящика.</p>
+      <p>Включите «Забирать заказы из 1С» и «Отправлять сообщения клиенту через 1С», затем «Отправлять самой». Сообщение создаётся в 1С и уходит с её учётной записи SMS или почты. Запасные каналы SMS.ru и Gmail используются, только если отправка через 1С выключена.</p>
       <p>Пока каналы пустые, программа всё равно пишет готовый текст. Его копируют в SMS Манго или в Telegram. После копирования сообщение уходит из очереди «Сегодня».</p>
     </article>`;
 }
