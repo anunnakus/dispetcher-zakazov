@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Диспетчер заказов</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <span>Аудио, заказы</span>
+        <strong>Диспетчер</strong>
+      </div>
+      <nav>
+        <button data-page="today" class="active">Сегодня</button>
+        <button data-page="orders">Заказы</button>
+        <button data-page="templates">Шаблоны</button>
+        <button data-page="settings">Настройки</button>
+        <button data-page="journal">Журнал</button>
+        <button data-page="help">Как управлять</button>
+      </nav>
+      <p class="aside-note">Пока это окно открыто, программа сама проверяет просрочки каждую минуту и забирает CSV из папки «входящие».</p>
+    </aside>
+    <main>
+      <header>
+        <h1 id="title">Сегодня</h1>
+        <div id="header-actions"></div>
+      </header>
+      <section id="view"></section>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
